@@ -1,2 +1,4 @@
-torch==2.7.1+cu128
+torch==2.7.1
 numpy==2.2.0
+datasets==4.1.1
+transformers==4.56.2
