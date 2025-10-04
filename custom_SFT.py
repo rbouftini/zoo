@@ -2,7 +2,6 @@ from datasets import load_from_disk
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
 import time
@@ -10,6 +9,8 @@ import time
 n_epochs=1
 train_batch_size=2
 val_batch_size=2
+logging_steps = 10
+eval_steps = 10
 max_lr = 5e-5
 
 model_name = "Qwen/Qwen3-0.6B-Base"
@@ -23,6 +24,21 @@ def get_lr(it):
     else:
         decay_ratio = (n_steps - it) / warmdown_steps
         return max_lr * decay_ratio
+    
+def get_val_loss():
+    model.eval()
+    steps = eval_steps // val_batch_size
+    it = iter(loader_val)
+    total_loss = 0.0
+    with torch.no_grad():
+        for _ in range(steps):
+            x = next(it)
+            out = model(**x)
+            loss = out.loss
+            total_loss += loss.item() / steps 
+
+    model.train()
+    return total_loss
 
 def collate(batch):
     batch_ids = [x["input_ids"] for x in batch]
@@ -41,11 +57,9 @@ loader_train = DataLoader(dataset["train"], batch_size=train_batch_size, collate
 model = AutoModelForCausalLM.from_pretrained(model_name, dtype="auto", device_map="auto")
 optimizer = torch.optim.AdamW(model.parameters())
 
-
 n_steps = len(loader_train)
 warmdown_steps = n_steps
 train_loss = 0.0
-logging_steps = 10
 
 for epoch in range(n_epochs):
     for step, x in enumerate(loader_train):
@@ -67,5 +81,6 @@ for epoch in range(n_epochs):
         time_taken = end_time - start_time
 
         if (step+1) % logging_steps == 0:
-            print(f"Step:{step+1}, training loss: {train_loss:.4f}, lr: {lr:.4e}, time: {time_taken:.4f} seconds")
+            val_loss = get_val_loss()
+            print(f"Step:{step+1}, training loss: {train_loss:.4f}, validation loss: {val_loss:.4f}, lr: {lr:.4e}, time: {time_taken:.4f} seconds")
             train_loss = 0.0
