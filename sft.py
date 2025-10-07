@@ -20,7 +20,7 @@ wandb_save = False
 
 model_name = "Qwen/Qwen3-0.6B-Base" 
 tokenizer = AutoTokenizer.from_pretrained(model_name) 
-dataset = load_from_disk("../lustre/stp-khz5k3a2g9k/users/rayane.bouftini/smoltalkIds").with_format(
+dataset = load_from_disk("../smoltalkIds").with_format(
                         "torch", columns=["input_ids", "prompt_len"]) 
 
 wandb.init(
@@ -119,6 +119,12 @@ for epoch in range(n_epochs):
 
             print(f"Step:{step+1}, training loss: {train_loss:.4f}, validation loss: {val_loss:.4f}, lr: {lr:.4e}, time: {time_taken:.4f} seconds") 
             train_loss = 0.0 
+
+tokenizer.eos_token = "<|im_end|>"
+
+model.config.eos_token_id = tokenizer.eos_token
+model.generation_config.eos_token_id = tokenizer.eos_token_id
+model.config.eos_token_id = tokenizer.eos_token_id
 
 save_dir = "checkpoints/SFT"
 model.save_pretrained(save_dir)
