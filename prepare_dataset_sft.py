@@ -42,4 +42,4 @@ print(dataset)
 dataset = dataset.filter(lambda ex: len(ex["input_ids"]) <=512, num_proc=16)
 print(dataset)
 
-dataset.save_to_disk("../lustre/stp-khz5k3a2g9k/users/rayane.bouftini/smoltalkIds")
+dataset.save_to_disk("../smoltalkIds")
