@@ -3,8 +3,8 @@ from trl import DPOConfig, DPOTrainer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import wandb, time
 
-model_name = "Qwen/Qwen3-0.6B-Base"
-model = AutoModelForCausalLM.from_pretrained("checkpoints/SFTHIGH")
+model_name = "checkpoints/SFT"
+model = AutoModelForCausalLM.from_pretrained(model_name)
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 train_dataset = load_dataset("trl-lib/ultrafeedback_binarized", split="train")
 
