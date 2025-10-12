@@ -8,7 +8,7 @@ import time
 import wandb 
 
 device = "cuda" if torch.cuda.is_available() else "cpu" 
-print("Device:", device) 
+print("Running on device:", device) 
 
 n_epochs = 1 
 train_batch_size = 8 
@@ -51,7 +51,7 @@ def get_val_loss():
     steps = eval_steps // val_batch_size 
     it = iter(loader_val) 
     total_loss = 0.0 
-    with torch.no_grad(): 
+    with torch.inference_mode(): 
         for _ in range(steps): 
             x = next(it) 
             x = {k: v.to(device, non_blocking=True) for k, v in x.items()} 
@@ -76,7 +76,7 @@ loader_val = DataLoader(dataset["test"], batch_size=val_batch_size, collate_fn=c
 loader_train = DataLoader(dataset["train"], batch_size=train_batch_size, collate_fn=collate, shuffle=True, pin_memory=True) 
 
 model = AutoModelForCausalLM.from_pretrained(model_name, dtype="auto") 
-model.config.use_cache = False 
+model.config.use_cache = False
 model.to(device) 
 optimizer = torch.optim.AdamW(model.parameters(), fused=True) 
 
