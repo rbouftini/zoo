@@ -5,14 +5,14 @@ import os
 from torch.utils.data import DataLoader
 import time
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-batch_size = 2
+device = "cuda:3" if torch.cuda.is_available() else "cpu"
+batch_size = 512
 model_names = ["SFT", "DPO/checkpoint-5178"]
 
 def collate(batch):
     inputs = [[{"role": "user", "content": x}] for x in batch]
     inputs = tokenizer.apply_chat_template(inputs, tokenize=False, add_generation_prompt=True, enable_thinking=False)
-    inputs = tokenizer(inputs, return_tensors="pt", padding=True).to(device)
+    inputs = tokenizer(inputs, return_tensors="pt", padding=True)
     return {"prompts": batch, "inputs": inputs}
 
 rows = {"prompt": []}
@@ -30,7 +30,7 @@ for i, model_name in enumerate(model_names):
             tokenizer.pad_token = tokenizer.eos_token
         tokenizer.padding_side = "left"
 
-    dataset = load_dataset("HuggingFaceH4/ultrafeedback_binarized", split="test_prefs[:10]")
+    dataset = load_dataset("HuggingFaceH4/ultrafeedback_binarized", split="test_prefs[:1000]")
     dataset = dataset.filter(lambda ex: len(tokenizer.encode(ex["prompt"])) < 200)
     print("Number of examples in dataset:", dataset.num_rows)
     column_names = dataset.column_names
@@ -42,6 +42,7 @@ for i, model_name in enumerate(model_names):
         inputs = x["inputs"]
         prompts = x["prompts"]
         with torch.inference_mode():
+            inputs = {k: v.to(device, non_blocking=True) for k, v in inputs.items()} 
             output_ids = model.generate(**inputs, max_new_tokens=512)
             for ins, outs, prompt  in zip(inputs["input_ids"], output_ids, prompts):
                 answer = tokenizer.decode(outs[ins.shape[0]:], skip_special_tokens=True)
@@ -54,7 +55,7 @@ dataset = Dataset.from_dict(rows)
 dataset.save_to_disk("../SFTvsDPO")
 
 model_name = "Skywork/Skywork-Reward-V2-Qwen3-0.6B"
-batch_size = 2
+batch_size = 512
 
 rm = AutoModelForSequenceClassification.from_pretrained(
     model_name,
@@ -67,22 +68,25 @@ tokenizer = AutoTokenizer.from_pretrained(model_name)
 
 def collate(batch):
     batch = tokenizer.apply_chat_template(batch, tokenize=False, add_generation_prompt=False)
-    batch = tokenizer(batch, return_tensors="pt", padding=True).to(device)
+    batch = tokenizer(batch, return_tensors="pt", padding=True)
     return batch
 
 n_examples = dataset.num_rows
 
-sft_loader = DataLoader(dataset["SFT"], batch_size=batch_size, collate_fn=collate, shuffle=False, pin_memory=True)
-dpo_loader = DataLoader(dataset["DPO"], batch_size=batch_size, collate_fn=collate, shuffle=False, pin_memory=True)
+sft_loader = DataLoader(dataset[model_names[0]], batch_size=batch_size, collate_fn=collate, shuffle=False, pin_memory=True)
+dpo_loader = DataLoader(dataset[model_names[1]], batch_size=batch_size, collate_fn=collate, shuffle=False, pin_memory=True)
 
 n_w = 0
 for a_0, a_1 in zip(sft_loader, dpo_loader):
+   a_0 = {k: v.to(device, non_blocking=True) for k, v in a_0.items()} 
+   a_1 = {k: v.to(device, non_blocking=True) for k, v in a_1.items()} 
    time_start = time.time()
    with torch.no_grad():
     scores_0 = rm(**a_0).logits
     scores_1 = rm(**a_1).logits
     n_w += (scores_1 > scores_0).long().sum(0).item()
 
+   torch.cuda.synchronize() 
    time_end = time.time()
    print(f"Time taken: {(time_end - time_start):.4f}")
 
