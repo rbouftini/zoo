@@ -15,9 +15,11 @@ path = f"checkpoints/{model_name}"
 
 init_seed = 42
 batch_size_rm = 8
-batch_size_train = 128
+total_batch_size = 256
+batch_size_train = 32
 num_trajectories = 4 
-mu = 1e-5
+accumulation_steps = total_batch_size // (batch_size_train*num_trajectories)
+mu = 1e-3
 n_epochs = 10
 logging_steps = 1
 
@@ -61,6 +63,7 @@ wandb.init(
         "model_name": model_name,
         "train_batch_size": batch_size_train,
         "num_trajectories_per_prompt": num_trajectories,
+        "accumulation_steps": accumulation_steps,
         "total_n_trajectories": batch_size_train*num_trajectories,
         "rm_batch_size": batch_size_rm,
         "logging_steps": logging_steps,
@@ -79,8 +82,13 @@ def perturb_params(model, mu, seed):
       param.add_(v.to(param.dtype), alpha=mu)
 
 global_step = 0
+n_w = 0
+n_trajs = 0
+mean_reward = 0.0
+start_time = time.time()
+
 for epoch in range(n_epochs):
-    for x in train_loader:
+    for micro_step, x in enumerate(train_loader):
         inputs = x["inputs"]
         prompts = x["prompts"]
         inputs = {k: v.to(device, non_blocking=True) for k, v in inputs.items()}
@@ -104,13 +112,11 @@ for epoch in range(n_epochs):
                         rows["prompt"].append(prompt)
 
         trajectories = Dataset.from_dict(rows)
-        n_trajs = trajectories.num_rows
+        n_trajs += trajectories.num_rows
 
         normal_loader = DataLoader(trajectories["0"], batch_size=batch_size_rm, collate_fn=collate_rm, shuffle=False, pin_memory=True)
         perturb_loader = DataLoader(trajectories["1"], batch_size=batch_size_rm, collate_fn=collate_rm, shuffle=False, pin_memory=True)
 
-        n_w = 0
-        mean_reward = 0.0
         for a_0, a_1 in zip(normal_loader, perturb_loader):
             a_0 = {k: v.to(device, non_blocking=True) for k, v in a_0.items()} 
             a_1 = {k: v.to(device, non_blocking=True) for k, v in a_1.items()} 
@@ -120,19 +126,33 @@ for epoch in range(n_epochs):
                 mean_reward += scores_0.sum(0)
                 scores_1 = rm(**a_1).logits
                 n_w += (scores_1 > scores_0).long().sum(0).item()
-
-        acc = n_w / n_trajs
-        mean_reward = (mean_reward / n_trajs).item()
-
-        if acc <= 1/2:
-            perturb_params(model, -2*mu, seed)
-
-        if (global_step+1) % logging_steps == 0:
-            wandb.log({
-                "reward": mean_reward,
-                "epoch": epoch,
-            }, step=global_step)
         
-        print(f"Step: {global_step}, reward: {mean_reward}, accuracy: {acc}")
+        if (micro_step+1) % accumulation_steps == 0:
 
-        global_step +=1
+            torch.cuda.synchronize()
+            end_time = time.time()
+            time_taken = end_time - start_time
+
+            acc = n_w / n_trajs
+            mean_reward = (mean_reward / n_trajs).item()
+
+            if acc <= 1/2:
+                perturb_params(model, -2*mu, seed)
+
+            if (global_step+1) % logging_steps == 0:
+                wandb.log({
+                    "reward": mean_reward,
+                    "epoch": epoch,
+                    "accuracy": acc,
+                }, step=global_step)
+            
+            print(f"Step: {global_step}, reward: {mean_reward}, accuracy: {acc}, time taken: {time_taken:.4f} seconds")
+
+            n_w = 0
+            n_trajs = 0
+            mean_reward = 0.0
+            global_step +=1
+            start_time = time.time()
+        
+        else:
+            perturb_params(model, -mu, seed)
