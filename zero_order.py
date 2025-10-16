@@ -6,7 +6,7 @@ import time
 import wandb
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
 print("Running on device:", device)
@@ -15,10 +15,10 @@ path = f"checkpoints/{model_name}"
 
 init_seed = 42
 batch_size_rm = 8
-batch_size_train = 64
-num_trajectories = 4
-mu = 1e-4
-n_epochs = 1
+batch_size_train = 128
+num_trajectories = 4 
+mu = 1e-5
+n_epochs = 10
 logging_steps = 1
 
 rm_name = "Skywork/Skywork-Reward-V2-Qwen3-0.6B"
@@ -47,8 +47,9 @@ tokenizer = AutoTokenizer.from_pretrained(path)
 
 model.to(device)
 
-dataset = load_dataset("HuggingFaceH4/ultrafeedback_binarized", split="train_prefs") 
+dataset = load_dataset("HuggingFaceH4/ultrafeedback_binarized", split="train_prefs[:500]") 
 dataset = dataset.filter(lambda ex: len(tokenizer.encode(ex["prompt"])) < 300, num_proc=16)
+print("Number of examples in dataset:", dataset.num_rows)
 
 train_loader = DataLoader(dataset=dataset["prompt"], batch_size=batch_size_train, collate_fn=collate_model,
                              shuffle=False, pin_memory=True)
@@ -77,13 +78,14 @@ def perturb_params(model, mu, seed):
       v = torch.randn(size=param.shape, device=device, generator=g)
       param.add_(v.to(param.dtype), alpha=mu)
 
+global_step = 0
 for epoch in range(n_epochs):
-    for idx ,x in enumerate(train_loader):
+    for x in train_loader:
         inputs = x["inputs"]
         prompts = x["prompts"]
         inputs = {k: v.to(device, non_blocking=True) for k, v in inputs.items()}
         rows = {"prompt": []}
-        seed = init_seed + idx
+        seed = init_seed + global_step
         for i in range(2):
             if i == 1:
                 perturb_params(model, mu, seed)
@@ -125,10 +127,12 @@ for epoch in range(n_epochs):
         if acc <= 1/2:
             perturb_params(model, -2*mu, seed)
 
-        if (idx+1) % logging_steps == 0:
+        if (global_step+1) % logging_steps == 0:
             wandb.log({
                 "reward": mean_reward,
                 "epoch": epoch,
-            }, step=idx)
+            }, step=global_step)
         
-        print(f"Step: {idx}, reward: {mean_reward}")
+        print(f"Step: {global_step}, reward: {mean_reward}, accuracy: {acc}")
+
+        global_step +=1
