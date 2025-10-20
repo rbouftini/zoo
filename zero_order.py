@@ -6,7 +6,7 @@ import time
 import wandb
 import os
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
 print("Running on device:", device)
@@ -17,10 +17,11 @@ init_seed = 42
 batch_size_rm = 8
 total_batch_size = 256
 batch_size_train = 32
-num_trajectories = 4 
+num_trajectories = 4
 accumulation_steps = total_batch_size // (batch_size_train*num_trajectories)
-mu = 1e-3
-n_epochs = 10
+mu = 1e-5
+lr = 1e-6
+n_epochs = 2
 logging_steps = 1
 
 rm_name = "Skywork/Skywork-Reward-V2-Qwen3-0.6B"
@@ -49,7 +50,7 @@ tokenizer = AutoTokenizer.from_pretrained(path)
 
 model.to(device)
 
-dataset = load_dataset("HuggingFaceH4/ultrafeedback_binarized", split="train_prefs[:500]") 
+dataset = load_dataset("HuggingFaceH4/ultrafeedback_binarized", split="train_prefs[:1000]") 
 dataset = dataset.filter(lambda ex: len(tokenizer.encode(ex["prompt"])) < 300, num_proc=16)
 print("Number of examples in dataset:", dataset.num_rows)
 
@@ -61,6 +62,7 @@ wandb.init(
     name=f"qwen3-0.6b-zero-order-{int(time.time())}",
     config={
         "model_name": model_name,
+        "total_batch_size": total_batch_size,
         "train_batch_size": batch_size_train,
         "num_trajectories_per_prompt": num_trajectories,
         "accumulation_steps": accumulation_steps,
@@ -69,6 +71,7 @@ wandb.init(
         "logging_steps": logging_steps,
         "n_epochs": n_epochs,
         "mu": mu,
+        "lr": lr,
         "train_examples": dataset.num_rows,
     },
 )
@@ -111,6 +114,8 @@ for epoch in range(n_epochs):
                     if i == 0:
                         rows["prompt"].append(prompt)
 
+        perturb_params(model, -mu, seed)
+
         trajectories = Dataset.from_dict(rows)
         n_trajs += trajectories.num_rows
 
@@ -135,9 +140,11 @@ for epoch in range(n_epochs):
 
             acc = n_w / n_trajs
             mean_reward = (mean_reward / n_trajs).item()
-
+            
             if acc <= 1/2:
-                perturb_params(model, -2*mu, seed)
+                perturb_params(model, -lr, seed)
+            else:
+                perturb_params(model, lr, seed)
 
             if (global_step+1) % logging_steps == 0:
                 wandb.log({
@@ -152,7 +159,8 @@ for epoch in range(n_epochs):
             n_trajs = 0
             mean_reward = 0.0
             global_step +=1
-            start_time = time.time()
-        
-        else:
-            perturb_params(model, -mu, seed)
+            start_time = time.time()    
+
+save_dir = "checkpoints/QwenRLHF"
+model.save_pretrained(save_dir)
+tokenizer.save_pretrained(save_dir)
