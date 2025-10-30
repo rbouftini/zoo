@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader
 import time 
 import wandb 
 import os
-import math
+from abc import ABC, abstractmethod
 import argparse
 
 # Temporarly
@@ -16,7 +16,7 @@ os.environ["WANDB_MODE"] = "offline"
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_name", help="Model", required=True, type=str)
 parser.add_argument("--opt", help="Optimizer", 
-                    choices=["Adam, SignSGD, RSS, MSS, SPSA, R-AdaZO"], default="Adam")
+                    choices=["Adam", "SignSGD", "RSS", "MSS", "SPSA", "R-AdaZO"], default="Adam")
 parser.add_argument("--epochs", help="Number of epochs",
                     default=2, type=int)
 parser.add_argument("--train_batch_size", help="Batch size of training data",
@@ -38,6 +38,7 @@ parser.add_argument("--warmdown_ratio", help="Ratio of total number of steps for
 
 args = parser.parse_args()
 
+init_seed = 21
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 device = "cuda" if torch.cuda.is_available() else "cpu" 
 print("Running on device:", device) 
@@ -68,6 +69,17 @@ def collate(batch):
     for i, x in enumerate(batch): 
         labels[i, :x["prompt_len"]] = -100 
     return {"input_ids": batch_ids, "attention_mask": attention_mask, "labels": labels} 
+
+def log(train_loss, lr, val_loss, time_taken, epoch, global_step):
+    wandb.log({
+    "train/loss_avg": train_loss,
+    "train/lr": lr,
+    "val/loss": val_loss,
+    "time/step_s": time_taken,
+    "epoch": epoch,
+    }, step=global_step+1)
+
+    print(f"Step:{global_step+1}, training loss: {train_loss:.4f}, validation loss: {val_loss:.4f}, lr: {lr:.4e}, time: {time_taken:.4f} seconds") 
 
 # Load Dataset (Default for now is Smoltalk)
 dataset = load_from_disk("../../smoltalkIds").with_format(
@@ -195,7 +207,7 @@ class BpTrainer():
         train_loss = 0.0 
         global_step = 0
         for epoch in range(args.epochs): 
-            for step, x in enumerate(loader_train): 
+            for x in loader_train: 
                 start_time = time.time() 
 
                 lr = self.lr_sched(global_step) 
@@ -216,25 +228,288 @@ class BpTrainer():
 
                 if (global_step+1) % args.logging_steps == 0: 
                     val_loss = get_val_loss() 
-                    
-                    wandb.log({
-                        "train/loss_avg": train_loss,
-                        "train/lr": lr,
-                        "val/loss": val_loss,
-                        "time/step_s": time_taken,
-                        "epoch": epoch,
-                    }, step=global_step+1)
-
-                    print(f"Step:{global_step+1}, training loss: {train_loss:.4f}, validation loss: {val_loss:.4f}, lr: {lr:.4e}, time: {time_taken:.4f} seconds") 
+                    log(train_loss, lr, val_loss, time_taken, epoch, global_step)
                     train_loss = 0.0 
                 
                 global_step += 1
 
-if args.opt == "Adam":
-    optimizer = torch.optim.Adam(model.parameters(), fused=True)
-    trainer = BpTrainer(model, optimizer, lr_sched)
-elif args.opt == "SignSGD":
-    optimizer = SignSGD(model.parameters(), fused=True)
-    trainer = BpTrainer(model, optimizer, lr_sched)
+class ZOTrainer(ABC):
+    def __init__(self, model, lr_sched, init_seed):
+        self.model = model
+        self.lr_sched = lr_sched
+        self.init_seed = init_seed
+
+    def perturb_params(self, mu, seed, dist="rademacher", projected_grad=None):
+        g = torch.Generator(device=device).manual_seed(seed)
+        with torch.no_grad():
+            for p in self.model.parameters():
+                if not p.requires_grad: 
+                    continue
+                if dist == "rademacher":
+                    r = 2 * torch.randint(0, 2, p.shape, generator=g, device=p.device, dtype=torch.float32) - 1
+                else:
+                    if dist != "normal":
+                        print("Perturbation distribution is not valid (normal, rademacher). Reverting back to normal distribution.")
+
+                    r = torch.randn(size=p.shape, device=device, generator=g, dtype=torch.float32)
+
+                if projected_grad:
+                    mu = -projected_grad * mu
+                p.add_(r.to(p.dtype), alpha=mu)
+
+    @abstractmethod
+    def train(self):
+        pass
+
+class SPSATrainer(ZOTrainer):
+    def __init__(self, model, lr_sched, mu_sched, init_seed):
+        super().__init__(model, lr_sched, init_seed)
+        self.mu_sched = mu_sched
+
+    def train(self):
+        for epoch in range(args.epochs): 
+            for x in loader_train: 
+                start_time = time.time() 
+                seed = init_seed + global_step
+
+                lr = self.lr_sched(global_step)
+                mu  = self.mu_sched(global_step)
+
+                losses = torch.empty(2)
+                x = {k: v.to(device, non_blocking=True) for k, v in x.items()} 
+                for i in range(2):
+                    if i == 0:
+                        self.perturb_params(mu, seed)
+                    else:
+                        self.perturb_params(-2*mu, seed)
+                    
+                    with torch.inference_mode():
+                        out = self.model(**x) 
+                        loss = out.loss
+                        losses[i] = loss
+                
+                train_loss += losses[0].item() / args.logging_steps 
+                end_time = time.time() 
+                time_taken = end_time - start_time 
+
+                self.perturb_params(mu, seed)
+
+                projected_grad = (losses[0] - losses[1]) / (2*mu)
+                self.perturb_params(lr, seed, projected_grad=projected_grad)
+
+                if (global_step+1) % args.logging_steps == 0: 
+                    val_loss = get_val_loss() 
+                    log(train_loss, lr, val_loss, time_taken, epoch, global_step)
+                    train_loss = 0.0 
+                
+                global_step += 1
+
+class Adam(torch.optim.Optimizer):
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8):
+
+        defaults = dict(lr=lr, betas=betas, eps=eps)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self):
+        for group in self.param_groups:
+            lr = group['lr']
+            beta1, beta2 = group['betas']
+            eps = group['eps']
+
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad.detach()
+                state = self.state[p]
+
+                if len(state) == 0:
+                    state['step'] = 0
+                    state['exp_avg'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+                    state['exp_avg_sq'] = torch.zeros_like(p, memory_format=torch.preserve_format)
+
+                exp_avg     = state['exp_avg']
+                exp_avg_sq  = state['exp_avg_sq']
+                state['step'] += 1
+                t = state['step']
+
+                exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+                bias_c1 = 1 - beta1 ** t
+                bias_c2 = 1 - beta2 ** t
+
+                step_size = lr / bias_c1
+                denom = (exp_avg_sq/ bias_c2).sqrt().add_(eps)
+
+                update = exp_avg / denom
+                p.add_(update, alpha=-step_size)
+
+class RAdaZO(ZOTrainer):
+    def __init__(self, model, optimizer, lr_sched, mu_sched, init_seed):
+        super().__init__(model, lr_sched, init_seed)
+        self.mu_sched = mu_sched
+        self.optimizer = optimizer
+        
+    def attach_grad(self, projected_grad, seed, dist="rademacher"):
+        g = torch.Generator(device=device).manual_seed(seed)
+        with torch.no_grad():
+            for p in self.model.parameters():
+                if not p.requires_grad: 
+                    continue
+                if dist == "rademacher":
+                    r = 2 * torch.randint(0, 2, p.shape, generator=g, device=p.device, dtype=torch.float32) - 1
+                else:
+                    if dist != "normal":
+                        print("Perturbation distribution is not valid (normal, rademacher). Reverting back to normal distribution.")
+
+                    r = torch.randn(size=p.shape, device=device, generator=g, dtype=torch.float32)
+
+                grad = projected_grad * r
+                p.grad = grad
+        
+    def train(self):
+        for epoch in range(args.epochs): 
+            for x in loader_train: 
+                start_time = time.time() 
+                seed = init_seed + global_step
+
+                lr = self.lr_sched(global_step)
+                for param_group in self.optimizer.param_groups: 
+                    param_group['lr'] = lr 
+                
+                mu  = self.mu_sched(global_step)
+
+                losses = torch.empty(2)
+                x = {k: v.to(device, non_blocking=True) for k, v in x.items()} 
+                for i in range(2):
+                    if i == 0:
+                        self.perturb_params(mu, seed)
+                    else:
+                        self.perturb_params(-2*mu, seed)
+                    
+                    with torch.inference_mode():
+                        out = self.model(**x) 
+                        loss = out.loss
+                        losses[i] = loss
+                
+                train_loss += losses[0].item() / args.logging_steps 
+                end_time = time.time() 
+                time_taken = end_time - start_time 
+
+                self.perturb_params(mu, seed)
+
+                projected_grad = (losses[0] - losses[1]) / (2*mu)
+                self.attach_grad(projected_grad, seed)
+
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+
+                if (global_step+1) % args.logging_steps == 0: 
+                    val_loss = get_val_loss() 
+                    log(train_loss, lr, val_loss, time_taken, epoch, global_step)
+                    train_loss = 0.0 
+                
+                global_step += 1
+    
+class RSSTrainer(ZOTrainer):
+    def __init__(self, model, lr_sched, init_seed):
+        super().__init__(model, lr_sched, init_seed)
+    
+    def train(self):
+        for epoch in range(args.epochs): 
+            for x in loader_train: 
+                start_time = time.time() 
+                seed = init_seed + global_step
+
+                lr = self.lr_sched(global_step) 
+                losses = torch.empty(2)
+                x = {k: v.to(device, non_blocking=True) for k, v in x.items()} 
+                for i in range(2):
+                    if i == 0:
+                        self.perturb_params(lr, seed)
+                    else:
+                        self.perturb_params(-2*lr, seed)
+                    
+                    with torch.inference_mode():
+                        out = self.model(**x) 
+                        loss = out.loss
+                        losses[i] = loss
+                
+                train_loss += losses[0].item() / args.logging_steps 
+                end_time = time.time() 
+                time_taken = end_time - start_time 
+
+                self.perturb_params(model, lr, seed)
+
+                if losses[0] < losses[1]:
+                    self.perturb_params(lr, seed)
+                elif losses[0] > losses[1]:
+                    self.perturb_params(-lr, seed)
+
+                if (global_step+1) % args.logging_steps == 0: 
+                    val_loss = get_val_loss() 
+                    log(train_loss, lr, val_loss, time_taken, epoch, global_step)
+                    train_loss = 0.0 
+                
+                global_step += 1
+
+class MSSTrainer(ZOTrainer):
+        def __init__(self, model, lr_sched, init_seed):
+            super().__init__(model, lr_sched, init_seed)
+    
+        def train(self):
+            for epoch in range(args.epochs): 
+                for x in loader_train: 
+                    start_time = time.time() 
+                    seed = init_seed + global_step
+
+                    lr = lr_sched(global_step) 
+                    losses = torch.empty(2)
+                    x = {k: v.to(device, non_blocking=True) for k, v in x.items()} 
+                    for i in range(2):
+                        if i == 1:
+                            self.perturb_params(model, lr, seed)
+                        
+                        with torch.inference_mode():
+                            out = model(**x) 
+                            loss = out.loss
+                            losses[i] = loss
+                    
+                    train_loss += losses[0].item() / args.logging_steps 
+                    end_time = time.time() 
+                    time_taken = end_time - start_time 
+                    
+                    self.perturb_params(model, -lr, seed)
+
+                    if losses[1] < losses[0]:
+                        self.perturb_params(model, lr, seed)
+
+                    if (global_step+1) % args.logging_steps == 0: 
+                        val_loss = get_val_loss() 
+                        log(train_loss, lr, val_loss, time_taken, epoch, global_step)
+                        train_loss = 0.0 
+                    
+                    global_step += 1
+
+match args.opt:
+    case "Adam":
+        optimizer = torch.optim.Adam(model.parameters(), fused=True)
+        trainer = BpTrainer(model, optimizer, lr_sched)
+    case "SignSGD":
+        optimizer = SignSGD(model.parameters(), fused=True)
+        trainer = BpTrainer(model, optimizer, lr_sched)
+    case "RSS":
+        trainer = RSSTrainer(model, lr_sched, init_seed)
+    case "MSS":
+        trainer = MSSTrainer(model, lr_sched, init_seed)
+    case "SPSA":
+        mu_sched = WSD(max_lr=args.mu, n_steps=n_steps, warmdown_ratio=0, warmup_ratio=0)
+        trainer = SPSATrainer(model, lr_sched, mu_sched, init_seed)
+    case "R-AdaZO":
+        mu_sched = WSD(max_lr=args.mu, n_steps=n_steps, warmdown_ratio=0, warmup_ratio=0)
+        optimizer = Adam(model.parameters())
+        trainer = RAdaZO(model, optimizer, lr_sched, mu_sched, init_seed)
 
 trainer.train()
