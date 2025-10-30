@@ -136,7 +136,7 @@ class WSD:
         self.warmup_steps = int(n_steps * warmup_ratio)
         self.warmdown_steps = int(n_steps * warmdown_ratio)
 
-    def __call__(self, it: int) -> float:
+    def __call__(self, it):
         if it < self.warmup_steps:
             return self.max_lr * (it + 1) / self.warmup_steps
         elif it < (self.n_steps - self.warmdown_steps):
@@ -267,6 +267,8 @@ class SPSATrainer(ZOTrainer):
         self.mu_sched = mu_sched
 
     def train(self):
+        train_loss = 0.0 
+        global_step = 0
         for epoch in range(args.epochs): 
             for x in loader_train: 
                 start_time = time.time() 
@@ -370,6 +372,8 @@ class RAdaZO(ZOTrainer):
                 p.grad = grad
         
     def train(self):
+        train_loss = 0.0 
+        global_step = 0
         for epoch in range(args.epochs): 
             for x in loader_train: 
                 start_time = time.time() 
@@ -418,6 +422,8 @@ class RSSTrainer(ZOTrainer):
         super().__init__(model, lr_sched, init_seed)
     
     def train(self):
+        train_loss = 0.0 
+        global_step = 0
         for epoch in range(args.epochs): 
             for x in loader_train: 
                 start_time = time.time() 
@@ -460,6 +466,8 @@ class MSSTrainer(ZOTrainer):
             super().__init__(model, lr_sched, init_seed)
     
         def train(self):
+            train_loss = 0.0 
+            global_step = 0
             for epoch in range(args.epochs): 
                 for x in loader_train: 
                     start_time = time.time() 
