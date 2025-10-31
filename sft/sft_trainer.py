@@ -9,12 +9,23 @@ import wandb
 import os
 from abc import ABC, abstractmethod
 import argparse
+import json
 
 # Temporarly
 os.environ["WANDB_MODE"] = "offline"
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--model_name", help="Model", required=True, type=str)
+parent_parser = argparse.ArgumentParser(add_help=False)
+parent_parser.add_argument("--config")
+args, _ = parent_parser.parse_known_args()
+
+config = {}
+if args.config:
+    with open(args.config) as f:
+        config = json.load(f)
+
+parser = argparse.ArgumentParser(parents=[parent_parser])   
+parser.add_argument("--model_name", help="Model", 
+                    default="Qwen/Qwen3-8B", type=str)
 parser.add_argument("--opt", help="Optimizer", 
                     choices=["Adam", "SignSGD", "RSS", "MSS", "SPSA", "R-AdaZO"], default="Adam")
 parser.add_argument("--epochs", help="Number of epochs",
@@ -36,6 +47,7 @@ parser.add_argument("--warmup_ratio", help="Ratio of total number of steps for a
 parser.add_argument("--warmdown_ratio", help="Ratio of total number of steps for a linear warmdown",
                     default=0.05, type=float)
 
+parser.set_defaults(**config)
 args = parser.parse_args()
 
 init_seed = 21

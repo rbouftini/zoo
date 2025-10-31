@@ -1,0 +1,13 @@
+{
+  "model_name": "Qwen/Qwen3-8B",
+  "opt": "RSS",
+  "epochs": 1,
+  "train_batch_size": 8,
+  "val_batch_size": 8,
+  "logging_steps": 50,
+  "eval_steps": 32,
+  "lr": 1e-4,
+  "mu": 1e-4,
+  "warmup_ratio": 0.03,
+  "warmdown_ratio": 0.6
+}
