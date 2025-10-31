@@ -34,7 +34,7 @@ parser.add_argument("--mu", help="Perturbation parameter",
 parser.add_argument("--warmup_ratio", help="Ratio of total number of steps for a linear warmup",
                     default=0.03, type=float)
 parser.add_argument("--warmdown_ratio", help="Ratio of total number of steps for a linear warmdown",
-                    default=0.2, type=float)
+                    default=0.05, type=float)
 
 args = parser.parse_args()
 
@@ -130,7 +130,7 @@ model.to(device)
 
 # Learning rate schedule (Warmup-stable-decay)
 class WSD:
-    def __init__(self, max_lr, n_steps, warmup_ratio=0.1, warmdown_ratio=0.2):
+    def __init__(self, max_lr, n_steps, warmup_ratio=0.05, warmdown_ratio=0.05):
         self.max_lr = float(max_lr)
         self.n_steps = int(n_steps)
         self.warmup_steps = int(n_steps * warmup_ratio)
@@ -447,7 +447,7 @@ class RSSTrainer(ZOTrainer):
                 end_time = time.time() 
                 time_taken = end_time - start_time 
 
-                self.perturb_params(model, lr, seed)
+                self.perturb_params(lr, seed)
 
                 if losses[0] < losses[1]:
                     self.perturb_params(lr, seed)
@@ -478,7 +478,7 @@ class MSSTrainer(ZOTrainer):
                     x = {k: v.to(device, non_blocking=True) for k, v in x.items()} 
                     for i in range(2):
                         if i == 1:
-                            self.perturb_params(model, lr, seed)
+                            self.perturb_params(lr, seed)
                         
                         with torch.inference_mode():
                             out = model(**x) 
@@ -489,10 +489,10 @@ class MSSTrainer(ZOTrainer):
                     end_time = time.time() 
                     time_taken = end_time - start_time 
                     
-                    self.perturb_params(model, -lr, seed)
+                    self.perturb_params(-lr, seed)
 
                     if losses[1] < losses[0]:
-                        self.perturb_params(model, lr, seed)
+                        self.perturb_params(lr, seed)
 
                     if (global_step+1) % args.logging_steps == 0: 
                         val_loss = get_val_loss() 
@@ -521,3 +521,5 @@ match args.opt:
         trainer = RAdaZO(model, optimizer, lr_sched, mu_sched, init_seed)
 
 trainer.train()
+
+wandb.finish()
