@@ -10,9 +10,10 @@ import os
 from abc import ABC, abstractmethod
 import argparse
 import json
+import math
 
 # Temporarly
-os.environ["WANDB_MODE"] = "offline"
+#os.environ["WANDB_MODE"] = "offline"
 
 parent_parser = argparse.ArgumentParser(add_help=False)
 parent_parser.add_argument("--config")
@@ -51,7 +52,7 @@ parser.set_defaults(**config)
 args = parser.parse_args()
 
 init_seed = 21
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 device = "cuda" if torch.cuda.is_available() else "cpu" 
 print("Running on device:", device) 
 
@@ -118,23 +119,21 @@ config={
 if args.opt in ["Adam", "SignSGD"]:
     wandb.init(
     project="sft",
-    name=f"{args.model_name}-{args.opt}-{int(time.time())}",
+    name=f"{args.model_name}-{args.opt}",
     config=config,
     )
 else:
     config["mu"] = args.mu
     wandb.init(
     project="sft",
-    name=f"{args.model_name}-{args.opt}-{int(time.time())}",
+    name=f"{args.model_name}-{args.opt}",
     config=config,
     )
 
 if args.opt in ["Adam", "SignSGD"]:
     model = AutoModelForCausalLM.from_pretrained(args.model_name, dtype="auto") 
 else:
-    model = AutoModelForCausalLM.from_pretrained(args.model_name, dtype=torch.float32) 
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+    model = AutoModelForCausalLM.from_pretrained(args.model_name, dtype=torch.float16) 
 
 tokenizer = AutoTokenizer.from_pretrained(args.model_name) 
 model.config.use_cache = False
@@ -157,8 +156,24 @@ class WSD:
             decay_ratio = (self.n_steps - it) / self.warmdown_steps
             return self.max_lr * decay_ratio
 
+# Learning rate schedule (linear-warmup-cosine-decay)
+class CosineDecay:
+    def __init__(self, max_lr, n_steps, warmup_ratio=0.05):
+        self.max_lr = float(max_lr)
+        self.n_steps = int(n_steps)
+        self.warmup_steps = int(n_steps * warmup_ratio)
+        self.warmdown_steps = self.n_steps - self.warmup_steps
+
+    def __call__(self, it):
+        if it < self.warmup_steps:
+            return self.max_lr * (it + 1) / self.warmup_steps
+        else:
+            decay_ratio = (it - self.warmup_steps) / (self.n_steps - self.warmup_steps)
+            coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+            return coeff * self.max_lr
+
 n_steps = len(loader_train) * args.epochs
-lr_sched = WSD(args.lr, n_steps, args.warmup_ratio, args.warmdown_ratio)
+lr_sched = CosineDecay(args.lr, n_steps, args.warmup_ratio)
 print(f"Total number of steps: {n_steps}, warmup steps: {lr_sched.warmup_steps}, decay steps: {lr_sched.warmdown_steps}")
 
 class SignSGD(torch.optim.Optimizer):
@@ -251,7 +266,7 @@ class ZOTrainer(ABC):
         self.lr_sched = lr_sched
         self.init_seed = init_seed
 
-    def perturb_params(self, mu, seed, dist="rademacher", projected_grad=None):
+    def perturb_params(self, mu, seed, dist="normal", projected_grad=None):
         g = torch.Generator(device=device).manual_seed(seed)
         with torch.no_grad():
             for p in self.model.parameters():
