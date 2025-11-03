@@ -13,7 +13,7 @@ import json
 import math
 
 # Temporarly
-#os.environ["WANDB_MODE"] = "offline"
+os.environ["WANDB_MODE"] = "offline"
 
 parent_parser = argparse.ArgumentParser(add_help=False)
 parent_parser.add_argument("--config")
@@ -53,7 +53,7 @@ parser.set_defaults(**config)
 args = parser.parse_args()
 
 init_seed = 21
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 device = "cuda" if torch.cuda.is_available() else "cpu" 
 print("Running on device:", device) 
 
@@ -75,13 +75,17 @@ def get_val_loss():
     return total_loss 
             
 def collate(batch): 
-    batch_ids = [x["input_ids"] for x in batch] 
-    batch_ids = pad_sequence(batch_ids, batch_first=True, padding_value=tokenizer.pad_token_id) 
+    batch_ids, masks = [], []
+    for row in batch:
+        batch_ids.append(row["input_ids"])
+        masks.append(row["mask"])
+
+    batch_ids = pad_sequence(batch_ids, batch_first=True, padding_value=tokenizer.pad_token_id)
+    masks = pad_sequence(masks, batch_first=True, padding_value=0) 
     attention_mask = (batch_ids != tokenizer.pad_token_id).long() 
     labels = batch_ids.clone() 
-    labels[batch_ids == tokenizer.pad_token_id] = -100 
-    for i, x in enumerate(batch): 
-        labels[i, :x["prompt_len"]] = -100 
+    labels[masks == 0] = -100 
+
     return {"input_ids": batch_ids, "attention_mask": attention_mask, "labels": labels} 
 
 def log(train_loss, lr, val_loss, time_taken, epoch, global_step):
@@ -97,7 +101,7 @@ def log(train_loss, lr, val_loss, time_taken, epoch, global_step):
 
 # Load Dataset (Default for now is Smoltalk)
 dataset = load_from_disk("../../smoltalkIds").with_format(
-                        "torch", columns=["input_ids", "prompt_len"])
+                        "torch", columns=["input_ids", "mask"])
 print(f"Number of training examples: {dataset.num_rows}")
 
 loader_val = DataLoader(dataset["test"], batch_size=args.val_batch_size, 
