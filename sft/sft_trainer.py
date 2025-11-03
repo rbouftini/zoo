@@ -47,6 +47,7 @@ parser.add_argument("--warmup_ratio", help="Ratio of total number of steps for a
                     default=0.03, type=float)
 parser.add_argument("--warmdown_ratio", help="Ratio of total number of steps for a linear warmdown",
                     default=0.05, type=float)
+parser.add_argument("--save", help="Save model locally", action="store_true")
 
 parser.set_defaults(**config)
 args = parser.parse_args()
@@ -548,5 +549,15 @@ match args.opt:
         trainer = RAdaZO(model, optimizer, lr_sched, mu_sched, init_seed)
 
 trainer.train()
+
+if args.save:
+    tokenizer.eos_token = "<|im_end|>"
+    model.config.eos_token_id = tokenizer.eos_token
+    model.generation_config.eos_token_id = tokenizer.eos_token_id
+    model.config.eos_token_id = tokenizer.eos_token_id
+
+    save_dir = "checkpoints/SFT"
+    model.save_pretrained(save_dir)
+    tokenizer.save_pretrained(save_dir)
 
 wandb.finish()
