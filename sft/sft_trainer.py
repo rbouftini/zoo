@@ -53,7 +53,7 @@ parser.set_defaults(**config)
 args = parser.parse_args()
 
 init_seed = 21
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 device = "cuda" if torch.cuda.is_available() else "cpu" 
 print("Running on device:", device) 
 
@@ -408,6 +408,7 @@ class RAdaZO(ZOTrainer):
         global_step = 0
         for epoch in range(args.epochs): 
             for x in loader_train: 
+                torch.cuda.synchronize()
                 start_time = time.time() 
                 seed = init_seed + global_step
 
@@ -430,7 +431,9 @@ class RAdaZO(ZOTrainer):
                         loss = out.loss
                         losses[i] = loss
                 
-                train_loss += losses[0].item() / args.logging_steps 
+                train_loss += losses[0].item() / args.logging_steps
+                
+                torch.cuda.synchronize() 
                 end_time = time.time() 
                 time_taken = end_time - start_time 
 
