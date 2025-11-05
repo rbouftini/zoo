@@ -52,8 +52,8 @@ parser.add_argument("--save", help="Save model locally", action="store_true")
 parser.set_defaults(**config)
 args = parser.parse_args()
 
-init_seed = 21
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+init_seed = 42
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 device = "cuda" if torch.cuda.is_available() else "cpu" 
 print("Running on device:", device) 
 
@@ -136,9 +136,9 @@ else:
     )
 
 if args.opt in ["Adam", "SignSGD"]:
-    model = AutoModelForCausalLM.from_pretrained(args.model_name, dtype="auto") 
+    model = AutoModelForCausalLM.from_pretrained(args.model_name, dtype="auto", attn_implementation="flash_attention_2") 
 else:
-    model = AutoModelForCausalLM.from_pretrained(args.model_name, dtype=torch.float16) 
+    model = AutoModelForCausalLM.from_pretrained(args.model_name, dtype=torch.float16, attn_implementation="flash_attention_2") 
 
 tokenizer = AutoTokenizer.from_pretrained(args.model_name) 
 model.config.use_cache = False
@@ -271,8 +271,9 @@ class ZOTrainer(ABC):
         self.lr_sched = lr_sched
         self.init_seed = init_seed
 
-    def perturb_params(self, mu, seed, dist="normal", projected_grad=None):
+    def perturb_params(self, mu, seed, projected_grad=None,  dist="normal"):
         g = torch.Generator(device=device).manual_seed(seed)
+        scale = mu
         with torch.no_grad():
             for p in self.model.parameters():
                 if not p.requires_grad: 
@@ -286,8 +287,8 @@ class ZOTrainer(ABC):
                     r = torch.randn(size=p.shape, device=device, generator=g, dtype=torch.float32)
 
                 if projected_grad:
-                    mu = -projected_grad * mu
-                p.add_(r.to(p.dtype), alpha=mu)
+                    scale = -projected_grad * mu
+                p.add_(r.to(p.dtype), alpha=scale)
 
     @abstractmethod
     def train(self):
@@ -369,7 +370,7 @@ class Adam(torch.optim.Optimizer):
                 t = state['step']
 
                 exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+                exp_avg_sq.mul_(beta2).addcmul_(exp_avg, exp_avg, value=1 - beta2)
 
                 bias_c1 = 1 - beta1 ** t
                 bias_c2 = 1 - beta2 ** t
@@ -393,12 +394,12 @@ class RAdaZO(ZOTrainer):
                 if not p.requires_grad: 
                     continue
                 if dist == "rademacher":
-                    r = 2 * torch.randint(0, 2, p.shape, generator=g, device=p.device, dtype=torch.float32) - 1
+                    r = 2 * torch.randint(0, 2, p.shape, generator=g, device=p.device, dtype=torch.float16) - 1
                 else:
                     if dist != "normal":
                         print("Perturbation distribution is not valid (normal, rademacher). Reverting back to normal distribution.")
 
-                    r = torch.randn(size=p.shape, device=device, generator=g, dtype=torch.float32)
+                    r = torch.randn(size=p.shape, device=device, generator=g, dtype=torch.float16)
 
                 grad = projected_grad * r
                 p.grad = grad
