@@ -319,6 +319,7 @@ class SPSATrainer(ZOTrainer):
         global_step = 0
         for epoch in range(args.epochs): 
             for x in loader_train: 
+                torch.cuda.synchronize()
                 start_time = time.time() 
                 seed = init_seed + global_step
 
@@ -339,8 +340,6 @@ class SPSATrainer(ZOTrainer):
                         losses[i] = loss
                 
                 train_loss += losses[0].item() / args.logging_steps 
-                end_time = time.time() 
-                time_taken = end_time - start_time 
 
                 self.perturb_params(mu, seed)
                 if ddp:
@@ -348,6 +347,10 @@ class SPSATrainer(ZOTrainer):
 
                 projected_grad = (losses[0] - losses[1]) / (2*mu)
                 self.perturb_params(lr, seed, projected_grad=projected_grad)
+
+                torch.cuda.synchronize()
+                end_time = time.time() 
+                time_taken = end_time - start_time 
 
                 if (global_step+1) % args.logging_steps == 0: 
                     val_loss = get_val_loss() 
@@ -451,10 +454,6 @@ class RAdaZO(ZOTrainer):
                         losses[i] = loss
                 
                 train_loss += losses[0].item() / args.logging_steps
-                
-                torch.cuda.synchronize() 
-                end_time = time.time() 
-                time_taken = end_time - start_time 
 
                 self.perturb_params(mu, seed)
 
@@ -466,6 +465,10 @@ class RAdaZO(ZOTrainer):
 
                 self.optimizer.step()
                 self.optimizer.zero_grad()
+
+                torch.cuda.synchronize()
+                end_time = time.time() 
+                time_taken = end_time - start_time
 
                 if (global_step+1) % args.logging_steps == 0: 
                     val_loss = get_val_loss() 
@@ -484,6 +487,7 @@ class RSSTrainer(ZOTrainer):
         global_step = 0
         for epoch in range(args.epochs): 
             for x in loader_train: 
+                torch.cuda.synchronize()
                 start_time = time.time() 
                 seed = init_seed + global_step
 
@@ -502,8 +506,6 @@ class RSSTrainer(ZOTrainer):
                         losses[i] = loss
                 
                 train_loss += losses[0].item() / args.logging_steps 
-                end_time = time.time() 
-                time_taken = end_time - start_time 
 
                 self.perturb_params(lr, seed)
 
@@ -514,6 +516,10 @@ class RSSTrainer(ZOTrainer):
                     self.perturb_params(lr, seed)
                 elif losses[0] > losses[1]:
                     self.perturb_params(-lr, seed)
+
+                torch.cuda.synchronize()
+                end_time = time.time() 
+                time_taken = end_time - start_time
 
                 if (global_step+1) % args.logging_steps == 0: 
                     val_loss = get_val_loss() 
