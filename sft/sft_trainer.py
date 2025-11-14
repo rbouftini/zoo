@@ -1,7 +1,6 @@
 from datasets import load_from_disk
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
-import torch.nn as nn 
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader 
 import time 
@@ -11,9 +10,14 @@ from abc import ABC, abstractmethod
 import argparse
 import json
 import math
+import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 # Temporarly
-os.environ["WANDB_MODE"] = "offline"
+os.environ["WANDB_MODE"] = "online"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+torch.set_float32_matmul_precision("high")
 
 parent_parser = argparse.ArgumentParser(add_help=False)
 parent_parser.add_argument("--config")
@@ -52,27 +56,45 @@ parser.add_argument("--save", help="Save model locally", action="store_true")
 parser.set_defaults(**config)
 args = parser.parse_args()
 
-init_seed = 42
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+init_seed = 16
 device = "cuda" if torch.cuda.is_available() else "cpu" 
 print("Running on device:", device) 
 
+# DDP setup
+ddp = int(os.environ.get('RANK', -1)) != -1
+if ddp:
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = torch.device("cuda", ddp_local_rank)
+    torch.cuda.set_device(device)
+    dist.init_process_group(backend="nccl", device_id=device)
+    dist.barrier()
+    master_process = ddp_rank == 0
+else:
+    master_process = True
+
 # Helper functions
-def get_val_loss(): 
+def get_val_loss():
     model.eval() 
-    steps = args.eval_steps // args.val_batch_size 
+    steps = args.eval_steps // args.val_batch_size
     it = iter(loader_val) 
-    total_loss = 0.0 
+    losses = []
     with torch.inference_mode(): 
         for _ in range(steps): 
             x = next(it) 
             x = {k: v.to(device, non_blocking=True) for k, v in x.items()} 
             out = model(**x) 
-            loss = out.loss 
-            total_loss += loss.item() / steps 
-            
+            loss = out.loss
+            losses.append(loss)
+
+    val_loss = torch.stack(losses).mean()
+    if ddp:
+        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG) 
+
+    val_loss = val_loss.item()   
     model.train()     
-    return total_loss 
+    return val_loss
             
 def collate(batch): 
     batch_ids, masks = [], []
@@ -102,12 +124,19 @@ def log(train_loss, lr, val_loss, time_taken, epoch, global_step):
 # Load Dataset (Default for now is Smoltalk)
 dataset = load_from_disk("../../smoltalkIds").with_format(
                         "torch", columns=["input_ids", "mask"])
-print(f"Number of training examples: {dataset.num_rows}")
+if master_process:
+    print(f"Number of training examples: {dataset.num_rows}")
+
+if ddp:
+    sampler_val = DistributedSampler(dataset["test"], shuffle=False)
+    sampler_train = DistributedSampler(dataset["train"], shuffle=False)
+else:
+    sampler_val, sampler_train = None, None
 
 loader_val = DataLoader(dataset["test"], batch_size=args.val_batch_size, 
-                        collate_fn=collate, shuffle=True, pin_memory=True) 
+                        collate_fn=collate, shuffle=False, pin_memory=True, sampler=sampler_val) 
 loader_train = DataLoader(dataset["train"], batch_size=args.train_batch_size, 
-                        collate_fn=collate, shuffle=True, pin_memory=True) 
+                        collate_fn=collate, shuffle=False, pin_memory=True, sampler=sampler_train) 
 
 # Wandb Setup
 config={
@@ -122,27 +151,32 @@ config={
 }
 
 if args.opt in ["Adam", "SignSGD"]:
-    wandb.init(
-    project="sft",
-    name=f"{args.model_name}-{args.opt}",
-    config=config,
-    )
+    if master_process:
+        wandb.init(
+        project="sft",
+        name=f"{args.model_name}-{args.opt}",
+        config=config,
+        )
 else:
     config["mu"] = args.mu
-    wandb.init(
-    project="sft",
-    name=f"{args.model_name}-{args.opt}",
-    config=config,
-    )
+    if master_process:
+        wandb.init(
+        project="sft",
+        name=f"{args.model_name}-{args.opt}",
+        config=config,
+        )
 
 if args.opt in ["Adam", "SignSGD"]:
-    model = AutoModelForCausalLM.from_pretrained(args.model_name, dtype="auto", attn_implementation="flash_attention_2") 
+    raw_model = AutoModelForCausalLM.from_pretrained(args.model_name, dtype="auto", attn_implementation="flash_attention_2") 
 else:
-    model = AutoModelForCausalLM.from_pretrained(args.model_name, dtype=torch.float16, attn_implementation="flash_attention_2") 
+    raw_model = AutoModelForCausalLM.from_pretrained(args.model_name, dtype=torch.float16, attn_implementation="flash_attention_2")
+    raw_model.eval()
 
 tokenizer = AutoTokenizer.from_pretrained(args.model_name) 
-model.config.use_cache = False
-model.to(device) 
+raw_model.config.use_cache = False
+raw_model.to(device) 
+
+model = DDP(raw_model, device_ids=[ddp_local_rank]) if ddp else raw_model
 
 # Learning rate schedule (Warmup-stable-decay)
 class WSD:
@@ -178,15 +212,13 @@ class CosineDecay:
             return coeff * self.max_lr
 
 n_steps = len(loader_train) * args.epochs
-lr_sched = CosineDecay(args.lr, n_steps, args.warmup_ratio)
-print(f"Total number of steps: {n_steps}, warmup steps: {lr_sched.warmup_steps}, decay steps: {lr_sched.warmdown_steps}")
+lr_sched = WSD(args.lr, n_steps, args.warmup_ratio, args.warmdown_ratio)
+if master_process:
+    print(f"Total number of steps: {n_steps}, warmup steps: {lr_sched.warmup_steps}, decay steps: {lr_sched.warmdown_steps}")
 
 class SignSGD(torch.optim.Optimizer):
-    def __init__(self, params, lr=0.001, momentum=0.0, weight_decay=0.0,
-                 dampening=0.0, nesterov=False, maximize=False, fused=False):
-
-        defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay,
-                        dampening=dampening, nesterov=nesterov, maximize=maximize)
+    def __init__(self, params, lr=0.001, fused=False):
+        defaults = dict(lr=lr)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -198,32 +230,12 @@ class SignSGD(torch.optim.Optimizer):
 
         for group in self.param_groups:
             lr        = group['lr']
-            momentum  = group['momentum']
-            weightdec = group['weight_decay']
-            damp      = group['dampening']
-            nesterov  = group['nesterov']
-            maximize  = group['maximize']
 
             for p in group['params']:
                 if p.grad is None:
                     continue
 
                 d_p = p.grad.detach()
-                if maximize:
-                    d_p = -d_p
-
-                if weightdec != 0:
-                    d_p = d_p.add(p, alpha=weightdec)
-
-                if momentum != 0:
-                    state = self.state[p]
-                    buf = state.get('momentum_buffer')
-                    if buf is None:
-                        buf = state['momentum_buffer'] = torch.clone(d_p).detach()
-                    else:
-                        buf.mul_(momentum).add_(d_p, alpha=1 - damp)
-                    d_p = d_p.add(buf, alpha=momentum) if nesterov else buf
-
                 update = d_p / (torch.abs(d_p)+1e-18)
                 p.add_(update, alpha=-lr)
 
@@ -240,6 +252,7 @@ class BpTrainer():
         global_step = 0
         for epoch in range(args.epochs): 
             for x in loader_train: 
+                torch.cuda.synchronize()
                 start_time = time.time() 
 
                 lr = self.lr_sched(global_step) 
@@ -255,12 +268,14 @@ class BpTrainer():
                 self.optimizer.zero_grad() 
                 
                 train_loss += loss.item() / args.logging_steps 
+                torch.cuda.synchronize()
                 end_time = time.time() 
                 time_taken = end_time - start_time 
 
                 if (global_step+1) % args.logging_steps == 0: 
                     val_loss = get_val_loss() 
-                    log(train_loss, lr, val_loss, time_taken, epoch, global_step)
+                    if master_process:
+                        log(train_loss, lr, val_loss, time_taken, epoch, global_step)
                     train_loss = 0.0 
                 
                 global_step += 1
@@ -271,7 +286,7 @@ class ZOTrainer(ABC):
         self.lr_sched = lr_sched
         self.init_seed = init_seed
 
-    def perturb_params(self, mu, seed, projected_grad=None,  dist="normal"):
+    def perturb_params(self, mu, seed, dist="normal", projected_grad=None):
         g = torch.Generator(device=device).manual_seed(seed)
         scale = mu
         with torch.no_grad():
@@ -279,16 +294,16 @@ class ZOTrainer(ABC):
                 if not p.requires_grad: 
                     continue
                 if dist == "rademacher":
-                    r = 2 * torch.randint(0, 2, p.shape, generator=g, device=p.device, dtype=torch.float32) - 1
+                    r = 2 * torch.randint(0, 2, p.shape, generator=g, device=p.device, dtype=p.dtype) - 1
                 else:
                     if dist != "normal":
                         print("Perturbation distribution is not valid (normal, rademacher). Reverting back to normal distribution.")
 
-                    r = torch.randn(size=p.shape, device=device, generator=g, dtype=torch.float32)
+                    r = torch.randn(size=p.shape, device=device, generator=g, dtype=p.dtype)
 
                 if projected_grad:
                     scale = -projected_grad * mu
-                p.add_(r.to(p.dtype), alpha=scale)
+                p.add_(r, alpha=scale)
 
     @abstractmethod
     def train(self):
@@ -310,7 +325,7 @@ class SPSATrainer(ZOTrainer):
                 lr = self.lr_sched(global_step)
                 mu  = self.mu_sched(global_step)
 
-                losses = torch.empty(2)
+                losses = torch.empty(2, device=device)
                 x = {k: v.to(device, non_blocking=True) for k, v in x.items()} 
                 for i in range(2):
                     if i == 0:
@@ -328,13 +343,16 @@ class SPSATrainer(ZOTrainer):
                 time_taken = end_time - start_time 
 
                 self.perturb_params(mu, seed)
+                if ddp:
+                    dist.all_reduce(losses, op=dist.ReduceOp.AVG)
 
                 projected_grad = (losses[0] - losses[1]) / (2*mu)
                 self.perturb_params(lr, seed, projected_grad=projected_grad)
 
                 if (global_step+1) % args.logging_steps == 0: 
                     val_loss = get_val_loss() 
-                    log(train_loss, lr, val_loss, time_taken, epoch, global_step)
+                    if master_process:
+                        log(train_loss, lr, val_loss, time_taken, epoch, global_step)
                     train_loss = 0.0 
                 
                 global_step += 1
@@ -370,7 +388,7 @@ class Adam(torch.optim.Optimizer):
                 t = state['step']
 
                 exp_avg.mul_(beta1).add_(grad, alpha=1 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(exp_avg, exp_avg, value=1 - beta2)
+                exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
 
                 bias_c1 = 1 - beta1 ** t
                 bias_c2 = 1 - beta2 ** t
@@ -387,19 +405,19 @@ class RAdaZO(ZOTrainer):
         self.mu_sched = mu_sched
         self.optimizer = optimizer
         
-    def attach_grad(self, projected_grad, seed, dist="rademacher"):
+    def attach_grad(self, projected_grad, seed, dist="normal"):
         g = torch.Generator(device=device).manual_seed(seed)
         with torch.no_grad():
             for p in self.model.parameters():
                 if not p.requires_grad: 
                     continue
                 if dist == "rademacher":
-                    r = 2 * torch.randint(0, 2, p.shape, generator=g, device=p.device, dtype=torch.float16) - 1
+                    r = 2 * torch.randint(0, 2, p.shape, generator=g, device=p.device, dtype=p.dtype) - 1
                 else:
                     if dist != "normal":
                         print("Perturbation distribution is not valid (normal, rademacher). Reverting back to normal distribution.")
 
-                    r = torch.randn(size=p.shape, device=device, generator=g, dtype=torch.float16)
+                    r = torch.randn(size=p.shape, device=device, generator=g, dtype=p.dtype)
 
                 grad = projected_grad * r
                 p.grad = grad
@@ -419,7 +437,7 @@ class RAdaZO(ZOTrainer):
                 
                 mu  = self.mu_sched(global_step)
 
-                losses = torch.empty(2)
+                losses = torch.empty(2, device=device)
                 x = {k: v.to(device, non_blocking=True) for k, v in x.items()} 
                 for i in range(2):
                     if i == 0:
@@ -440,6 +458,9 @@ class RAdaZO(ZOTrainer):
 
                 self.perturb_params(mu, seed)
 
+                if ddp:
+                    dist.all_reduce(losses, op=dist.ReduceOp.AVG)
+                    
                 projected_grad = (losses[0] - losses[1]) / (2*mu)
                 self.attach_grad(projected_grad, seed)
 
@@ -448,7 +469,8 @@ class RAdaZO(ZOTrainer):
 
                 if (global_step+1) % args.logging_steps == 0: 
                     val_loss = get_val_loss() 
-                    log(train_loss, lr, val_loss, time_taken, epoch, global_step)
+                    if master_process:
+                        log(train_loss, lr, val_loss, time_taken, epoch, global_step)
                     train_loss = 0.0 
                 
                 global_step += 1
@@ -466,7 +488,7 @@ class RSSTrainer(ZOTrainer):
                 seed = init_seed + global_step
 
                 lr = self.lr_sched(global_step) 
-                losses = torch.empty(2)
+                losses = torch.empty(2, device=device)
                 x = {k: v.to(device, non_blocking=True) for k, v in x.items()} 
                 for i in range(2):
                     if i == 0:
@@ -485,6 +507,9 @@ class RSSTrainer(ZOTrainer):
 
                 self.perturb_params(lr, seed)
 
+                if ddp:
+                    dist.all_reduce(losses, op=dist.ReduceOp.AVG)
+
                 if losses[0] < losses[1]:
                     self.perturb_params(lr, seed)
                 elif losses[0] > losses[1]:
@@ -492,7 +517,8 @@ class RSSTrainer(ZOTrainer):
 
                 if (global_step+1) % args.logging_steps == 0: 
                     val_loss = get_val_loss() 
-                    log(train_loss, lr, val_loss, time_taken, epoch, global_step)
+                    if master_process:
+                        log(train_loss, lr, val_loss, time_taken, epoch, global_step)
                     train_loss = 0.0 
                 
                 global_step += 1
@@ -510,7 +536,7 @@ class MSSTrainer(ZOTrainer):
                     seed = init_seed + global_step
 
                     lr = lr_sched(global_step) 
-                    losses = torch.empty(2)
+                    losses = torch.empty(2, device=device)
                     x = {k: v.to(device, non_blocking=True) for k, v in x.items()} 
                     for i in range(2):
                         if i == 1:
@@ -527,12 +553,16 @@ class MSSTrainer(ZOTrainer):
                     
                     self.perturb_params(-lr, seed)
 
+                    if ddp:
+                        dist.all_reduce(losses, op=dist.ReduceOp.AVG)
+
                     if losses[1] < losses[0]:
                         self.perturb_params(lr, seed)
 
                     if (global_step+1) % args.logging_steps == 0: 
                         val_loss = get_val_loss() 
-                        log(train_loss, lr, val_loss, time_taken, epoch, global_step)
+                        if master_process:
+                            log(train_loss, lr, val_loss, time_taken, epoch, global_step)
                         train_loss = 0.0 
                     
                     global_step += 1
@@ -558,14 +588,17 @@ match args.opt:
 
 trainer.train()
 
-if args.save:
+if args.save and master_process:
     tokenizer.eos_token = "<|im_end|>"
-    model.config.eos_token_id = tokenizer.eos_token
-    model.generation_config.eos_token_id = tokenizer.eos_token_id
-    model.config.eos_token_id = tokenizer.eos_token_id
+    raw_model.config.eos_token_id = tokenizer.eos_token
+    raw_model.generation_config.eos_token_id = tokenizer.eos_token_id
+    raw_model.config.eos_token_id = tokenizer.eos_token_id
 
-    save_dir = "checkpoints/SFT"
-    model.save_pretrained(save_dir)
+    save_dir = f"checkpoints/{args.model_name}"
+    raw_model.save_pretrained(save_dir)
     tokenizer.save_pretrained(save_dir)
+
+if ddp:
+    dist.destroy_process_group()
 
 wandb.finish()
