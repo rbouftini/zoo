@@ -75,14 +75,18 @@ else:
     master_process = True
 
 # Helper functions
+def gen_val(loader_val):
+    while True:
+        for batch in loader_val:
+            yield batch
+
 def get_val_loss():
     model.eval() 
     steps = args.eval_steps // args.val_batch_size
-    it = iter(loader_val) 
     losses = []
     with torch.inference_mode(): 
         for _ in range(steps): 
-            x = next(it) 
+            x = next(it_val)
             x = {k: v.to(device, non_blocking=True) for k, v in x.items()} 
             out = model(**x) 
             loss = out.loss
@@ -137,6 +141,7 @@ loader_val = DataLoader(dataset["test"], batch_size=args.val_batch_size,
                         collate_fn=collate, shuffle=False, pin_memory=True, sampler=sampler_val) 
 loader_train = DataLoader(dataset["train"], batch_size=args.train_batch_size, 
                         collate_fn=collate, shuffle=False, pin_memory=True, sampler=sampler_train) 
+it_val = gen_val(loader_val)
 
 # Wandb Setup
 config={
