@@ -8,12 +8,13 @@ model_name = "Qwen/Qwen3-0.6B-Base"
 dataset_name = "allenai/tulu-3-sft-mixture"
 N_TRAIN_EX = 200000
 N_TEST_EX = 10000
+seed = 1337
 
 dataset = load_dataset(dataset_name, split="train")
 dataset = dataset.remove_columns(["id", "source"])
-dataset = dataset.shuffle(seed=1337)
+dataset = dataset.shuffle(seed=seed)
 
-dataset = dataset.train_test_split(test_size=0.1)
+dataset = dataset.train_test_split(test_size=0.1, seed=seed)
 dataset["train"] = dataset["train"].select(range(min(N_TRAIN_EX, dataset["train"].num_rows)))
 dataset["test"] = dataset["test"].select(range(min(N_TEST_EX, dataset["test"].num_rows)))
 
@@ -29,22 +30,22 @@ def format(row):
         input_ids.extend(ids)
         mask.extend([mask_val] * len(ids))
 
-    # Sometimes the conversation starts with a system prompt
+    # Sometimes the conversation starts with a system prompt, we skip those messages
     if messages[0]["role"] == "system":
-        msg = "<|im_start|>system\n" + messages[0]["content"] + "<|im_end|>\n"
-        ids = tokenizer.encode(msg)
+        msg = messages[0]["content"] + "\n\n"
+        ids = tokenizer.encode(msg, add_special_tokens=False)
         add_tokens(ids, 0)
         messages = messages[1:]
     
     for message in messages:
         if message["role"] == "user":
-            msg = "<|im_start|>user\n" + message["content"] + "<|im_end|>\n"
-            ids = tokenizer.encode(msg)
+            msg = "### Instruction:\n" + message["content"] + "\n\n### Response:\n"
+            ids = tokenizer.encode(msg, add_special_tokens=False)
             add_tokens(ids, 0)
         else:
             assert message["role"] == "assistant"
-            msg =  "<|im_start|>assistant\n<think>\n\n</think>\n\n" + message["content"] + "<|im_end|>\n"
-            ids = tokenizer.encode(msg)
+            msg =  message["content"] + "<|endoftext|>"
+            ids = tokenizer.encode(msg, add_special_tokens=False)
             add_tokens(ids, 1)
 
     return {
