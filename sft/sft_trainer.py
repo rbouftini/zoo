@@ -1,5 +1,8 @@
 from datasets import load_from_disk
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from dataclasses import dataclass
+from transformers import DefaultDataCollator
+import numpy as np
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader 
@@ -36,6 +39,8 @@ parser.add_argument("--opt", help="Optimizer",
 parser.add_argument("--epochs", help="Number of epochs",
                     default=2, type=int)
 parser.add_argument("--train_batch_size", help="Batch size of training data",
+                    default=1, type=int)
+parser.add_argument("--grad_accum_steps", help="Gradient accumulation steps",
                     default=1, type=int)
 parser.add_argument("--val_batch_size", help="Batch size of validation data",
                     default=1, type=int)
@@ -75,9 +80,9 @@ else:
     master_process = True
 
 # Helper functions
-def gen_val(loader_val):
+def gen_batch(loader):
     while True:
-        for batch in loader_val:
+        for batch in loader:
             yield batch
 
 def get_val_loss():
@@ -87,7 +92,6 @@ def get_val_loss():
     with torch.inference_mode(): 
         for _ in range(steps): 
             x = next(it_val)
-            x = {k: v.to(device, non_blocking=True) for k, v in x.items()} 
             out = model(**x) 
             loss = out.loss
             losses.append(loss)
@@ -114,6 +118,90 @@ def collate(batch):
 
     return {"input_ids": batch_ids, "attention_mask": attention_mask, "labels": labels} 
 
+@dataclass
+class TensorDataCollatorWithFlattening(DefaultDataCollator):
+    return_flash_attn_kwargs: bool = True
+    return_position_ids: bool = True
+    return_seq_idx: bool = True
+    separator_id: int = -100
+
+    def __call__(self, features, return_tensors=None, separator_id=None):
+        if return_tensors is None:
+            return_tensors = self.return_tensors
+        if separator_id is None:
+            separator_id = self.separator_id
+
+        if self.return_flash_attn_kwargs:
+            cu_seq_lens = [0]
+            max_length = 0
+        if self.return_position_ids:
+            pos_ids = []
+        if self.return_seq_idx:
+            seq_idx = []
+
+        is_labels_provided = "labels" in features[0]
+        has_mask = "mask" in features[0]
+
+        ret = {"input_ids": [], "labels": []}
+        # build on CPU first; we'll move to `device` at the end
+        separator = torch.tensor(
+            [separator_id],
+            dtype=features[0]["input_ids"].dtype,
+            device=features[0]["input_ids"].device,
+        )
+
+        for s_idx, item in enumerate(features):
+            input_ids = item["input_ids"]
+            ret["input_ids"].append(input_ids)
+
+            # --- labels logic: prefer provided labels, else mask, else LM ---
+            if is_labels_provided:
+                labels = item["labels"]
+            elif has_mask:
+                labels = input_ids.clone()
+                labels[item["mask"] == 0] = -100
+            else:
+                labels = input_ids
+
+            # original FA2-style separator + [1:] trick
+            ret["labels"].append(separator)
+            ret["labels"].append(labels[1:])
+
+            if self.return_flash_attn_kwargs:
+                cu_seq_lens.append(cu_seq_lens[-1] + len(input_ids))
+                max_length = max(max_length, len(input_ids))
+            if self.return_position_ids:
+                pos_ids.append(torch.arange(input_ids.numel(), device=input_ids.device))
+            if self.return_seq_idx:
+                seq_idx.append(torch.full_like(input_ids, s_idx, dtype=torch.int32))
+
+        base_device = features[0]["input_ids"].device  # usually CPU before we move
+
+        if self.return_flash_attn_kwargs:
+            ret["cu_seq_lens_q"] = ret["cu_seq_lens_k"] = torch.tensor(
+                cu_seq_lens, dtype=torch.int32, device=base_device
+            )
+            ret["max_length_q"] = ret["max_length_k"] = max_length
+        if self.return_position_ids:
+            ret["position_ids"] = torch.cat(pos_ids, dim=0)[None]
+        if self.return_seq_idx:
+            ret["seq_idx"] = torch.cat(seq_idx, dim=0)[None]
+
+        ret["input_ids"] = torch.cat(ret["input_ids"], dim=0)[None]
+        ret["labels"] = torch.cat(ret["labels"], dim=0)[None]
+
+        # no padding → attention_mask all ones
+        ret["attention_mask"] = torch.ones_like(ret["input_ids"], dtype=torch.int32)
+
+        # 🔥 NEW: move everything to the global `device`
+        from torch import device as _torch_device  # just to be explicit
+
+        for k, v in list(ret.items()):
+            if isinstance(v, torch.Tensor):
+                ret[k] = v.to(device)
+
+        return ret
+
 def log(train_loss, lr, val_loss, time_taken, epoch, global_step):
     wandb.log({
     "train/loss_avg": train_loss,
@@ -121,15 +209,18 @@ def log(train_loss, lr, val_loss, time_taken, epoch, global_step):
     "val/loss": val_loss,
     "time/step_s": time_taken,
     "epoch": epoch,
-    }, step=global_step+1)
+    }, step=global_step)
 
-    print(f"Step:{global_step+1}, training loss: {train_loss:.4f}, validation loss: {val_loss:.4f}, lr: {lr:.4e}, time: {time_taken:.4f} seconds") 
+    print(f"Step:{global_step}, training loss: {train_loss:.4f}, validation loss: {val_loss:.4f}, lr: {lr:.4e}, time: {time_taken:.4f} seconds") 
 
 # Load Dataset (Default for now is Smoltalk)
 dataset = load_from_disk("../../smoltalkIds").with_format(
                         "torch", columns=["input_ids", "mask"])
+#dataset["train"]= dataset["train"].select(range(8))
+
 if master_process:
     print(f"Number of training examples: {dataset.num_rows}")
+    print("Gradient accumulation steps:", args.grad_accum_steps)
 
 if ddp:
     sampler_val = DistributedSampler(dataset["test"], shuffle=False)
@@ -137,11 +228,13 @@ if ddp:
 else:
     sampler_val, sampler_train = None, None
 
+collate_fn = TensorDataCollatorWithFlattening()
 loader_val = DataLoader(dataset["test"], batch_size=args.val_batch_size, 
-                        collate_fn=collate, shuffle=False, pin_memory=True, sampler=sampler_val) 
+                        collate_fn=collate_fn, shuffle=False,sampler=sampler_val) 
 loader_train = DataLoader(dataset["train"], batch_size=args.train_batch_size, 
-                        collate_fn=collate, shuffle=False, pin_memory=True, sampler=sampler_train) 
-it_val = gen_val(loader_val)
+                        collate_fn=collate_fn, shuffle=False, sampler=sampler_train) 
+it_val = gen_batch(loader_val)
+it_train = gen_batch(loader_train)
 
 # Wandb Setup
 config={
@@ -174,7 +267,7 @@ else:
 if args.opt in ["Adam", "SignSGD"]:
     raw_model = AutoModelForCausalLM.from_pretrained(args.model_name, dtype="auto", attn_implementation="flash_attention_2") 
 else:
-    raw_model = AutoModelForCausalLM.from_pretrained(args.model_name, dtype=torch.float16, attn_implementation="flash_attention_2")
+    raw_model = AutoModelForCausalLM.from_pretrained(args.model_name, dtype=torch.bfloat16, attn_implementation="flash_attention_2")
     raw_model.eval()
 
 tokenizer = AutoTokenizer.from_pretrained(args.model_name) 
@@ -215,9 +308,9 @@ class CosineDecay:
             decay_ratio = (it - self.warmup_steps) / (self.n_steps - self.warmup_steps)
             coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
             return coeff * self.max_lr
-
-n_steps = len(loader_train) * args.epochs
-lr_sched = WSD(args.lr, n_steps, args.warmup_ratio, args.warmdown_ratio)
+        
+n_steps = len(loader_train) * args.epochs // args.grad_accum_steps
+lr_sched = CosineDecay(args.lr, n_steps, args.warmup_ratio)
 if master_process:
     print(f"Total number of steps: {n_steps}, warmup steps: {lr_sched.warmup_steps}, decay steps: {lr_sched.warmdown_steps}")
 
@@ -253,38 +346,38 @@ class BpTrainer():
         self.optimizer = optimizer
 
     def train(self):
-        train_loss = 0.0 
-        global_step = 0
-        for epoch in range(args.epochs): 
-            for x in loader_train: 
-                torch.cuda.synchronize()
-                start_time = time.time() 
+        train_loss = 0.0
+        for step in range(n_steps): 
+            torch.cuda.synchronize()
+            start_time = time.time() 
 
-                lr = self.lr_sched(global_step) 
-                for param_group in self.optimizer.param_groups: 
-                    param_group['lr'] = lr 
+            lr = self.lr_sched(step) 
+            for param_group in self.optimizer.param_groups: 
+                param_group['lr'] = lr 
 
-                x = {k: v.to(device, non_blocking=True) for k, v in x.items()} 
+            for i in range(args.grad_accum_steps):
+                x = next(it_train)
                 out = self.model(**x) 
                 loss = out.loss 
+                loss = loss / args.grad_accum_steps
+                train_loss += loss.detach().item()
                 loss.backward() 
 
-                self.optimizer.step() 
-                self.optimizer.zero_grad() 
-                
-                train_loss += loss.item() / args.logging_steps 
-                torch.cuda.synchronize()
-                end_time = time.time() 
-                time_taken = end_time - start_time 
+            self.optimizer.step() 
+            self.optimizer.zero_grad(set_to_none=True) 
+            
+            torch.cuda.synchronize()
+            end_time = time.time() 
+            time_taken = end_time - start_time 
 
-                if (global_step+1) % args.logging_steps == 0: 
-                    val_loss = get_val_loss() 
-                    if master_process:
-                        log(train_loss, lr, val_loss, time_taken, epoch, global_step)
-                    train_loss = 0.0 
-                
-                global_step += 1
-
+            if step % args.logging_steps == 0: 
+                if step != 0:
+                    train_loss = train_loss / args.logging_steps
+                val_loss = get_val_loss() 
+                if master_process:
+                    log(train_loss, lr, val_loss, time_taken, 1, step)
+                train_loss = 0.0
+            
 class ZOTrainer(ABC):
     def __init__(self, model, lr_sched, init_seed):
         self.model = model
@@ -295,7 +388,7 @@ class ZOTrainer(ABC):
         g = torch.Generator(device=device).manual_seed(seed)
         scale = mu
         with torch.no_grad():
-            for p in self.model.parameters():
+            for name, p in self.model.named_parameters():
                 if not p.requires_grad: 
                     continue
                 if dist == "rademacher":
@@ -498,7 +591,6 @@ class RSSTrainer(ZOTrainer):
 
                 lr = self.lr_sched(global_step) 
                 losses = torch.empty(2, device=device)
-                x = {k: v.to(device, non_blocking=True) for k, v in x.items()} 
                 for i in range(2):
                     if i == 0:
                         self.perturb_params(lr, seed)
@@ -510,7 +602,7 @@ class RSSTrainer(ZOTrainer):
                         loss = out.loss
                         losses[i] = loss
                 
-                train_loss += losses[0].item() / args.logging_steps 
+                train_loss += losses[0].item()
 
                 self.perturb_params(lr, seed)
 
@@ -526,7 +618,9 @@ class RSSTrainer(ZOTrainer):
                 end_time = time.time() 
                 time_taken = end_time - start_time
 
-                if (global_step+1) % args.logging_steps == 0: 
+                if global_step % args.logging_steps == 0: 
+                    if global_step != 0:
+                        train_loss = train_loss / args.logging_steps
                     val_loss = get_val_loss() 
                     if master_process:
                         log(train_loss, lr, val_loss, time_taken, epoch, global_step)
@@ -537,16 +631,17 @@ class RSSTrainer(ZOTrainer):
 class MSSTrainer(ZOTrainer):
         def __init__(self, model, lr_sched, init_seed):
             super().__init__(model, lr_sched, init_seed)
+            self.margin = 1e4
     
         def train(self):
             train_loss = 0.0 
             global_step = 0
+            seed = init_seed
+            lr = args.lr
             for epoch in range(args.epochs): 
                 for x in loader_train: 
                     start_time = time.time() 
-                    seed = init_seed + global_step
-
-                    lr = lr_sched(global_step) 
+                    
                     losses = torch.empty(2, device=device)
                     x = {k: v.to(device, non_blocking=True) for k, v in x.items()} 
                     for i in range(2):
@@ -567,9 +662,12 @@ class MSSTrainer(ZOTrainer):
                     if ddp:
                         dist.all_reduce(losses, op=dist.ReduceOp.AVG)
 
-                    if losses[1] < losses[0]:
+                    if losses[1] < losses[0] - self.margin*(lr**2):
                         self.perturb_params(lr, seed)
-
+                    else:
+                        seed = init_seed + global_step
+                        lr = args.lr / np.sqrt(global_step+1)
+                        
                     if (global_step+1) % args.logging_steps == 0: 
                         val_loss = get_val_loss() 
                         if master_process:
