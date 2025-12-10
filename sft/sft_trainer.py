@@ -143,7 +143,6 @@ class TensorDataCollatorWithFlattening(DefaultDataCollator):
         has_mask = "mask" in features[0]
 
         ret = {"input_ids": [], "labels": []}
-        # build on CPU first; we'll move to `device` at the end
         separator = torch.tensor(
             [separator_id],
             dtype=features[0]["input_ids"].dtype,
@@ -154,7 +153,6 @@ class TensorDataCollatorWithFlattening(DefaultDataCollator):
             input_ids = item["input_ids"]
             ret["input_ids"].append(input_ids)
 
-            # --- labels logic: prefer provided labels, else mask, else LM ---
             if is_labels_provided:
                 labels = item["labels"]
             elif has_mask:
@@ -163,7 +161,6 @@ class TensorDataCollatorWithFlattening(DefaultDataCollator):
             else:
                 labels = input_ids
 
-            # original FA2-style separator + [1:] trick
             ret["labels"].append(separator)
             ret["labels"].append(labels[1:])
 
@@ -175,7 +172,7 @@ class TensorDataCollatorWithFlattening(DefaultDataCollator):
             if self.return_seq_idx:
                 seq_idx.append(torch.full_like(input_ids, s_idx, dtype=torch.int32))
 
-        base_device = features[0]["input_ids"].device  # usually CPU before we move
+        base_device = features[0]["input_ids"].device 
 
         if self.return_flash_attn_kwargs:
             ret["cu_seq_lens_q"] = ret["cu_seq_lens_k"] = torch.tensor(
@@ -190,11 +187,7 @@ class TensorDataCollatorWithFlattening(DefaultDataCollator):
         ret["input_ids"] = torch.cat(ret["input_ids"], dim=0)[None]
         ret["labels"] = torch.cat(ret["labels"], dim=0)[None]
 
-        # no padding → attention_mask all ones
         ret["attention_mask"] = torch.ones_like(ret["input_ids"], dtype=torch.int32)
-
-        # 🔥 NEW: move everything to the global `device`
-        from torch import device as _torch_device  # just to be explicit
 
         for k, v in list(ret.items()):
             if isinstance(v, torch.Tensor):
@@ -216,7 +209,6 @@ def log(train_loss, lr, val_loss, time_taken, epoch, global_step):
 # Load Dataset (Default for now is Smoltalk)
 dataset = load_from_disk("../../smoltalkIds").with_format(
                         "torch", columns=["input_ids", "mask"])
-#dataset["train"]= dataset["train"].select(range(8))
 
 if master_process:
     print(f"Number of training examples: {dataset.num_rows}")
@@ -267,7 +259,7 @@ else:
 if args.opt in ["Adam", "SignSGD"]:
     raw_model = AutoModelForCausalLM.from_pretrained(args.model_name, dtype="auto", attn_implementation="flash_attention_2") 
 else:
-    raw_model = AutoModelForCausalLM.from_pretrained(args.model_name, dtype=torch.bfloat16, attn_implementation="flash_attention_2")
+    raw_model = AutoModelForCausalLM.from_pretrained(args.model_name, dtype=torch.float16, attn_implementation="flash_attention_2")
     raw_model.eval()
 
 tokenizer = AutoTokenizer.from_pretrained(args.model_name) 
@@ -310,7 +302,7 @@ class CosineDecay:
             return coeff * self.max_lr
         
 n_steps = len(loader_train) * args.epochs // args.grad_accum_steps
-lr_sched = CosineDecay(args.lr, n_steps, args.warmup_ratio)
+lr_sched = WSD(args.lr, n_steps, args.warmup_ratio, args.warmdown_ratio)
 if master_process:
     print(f"Total number of steps: {n_steps}, warmup steps: {lr_sched.warmup_steps}, decay steps: {lr_sched.warmdown_steps}")
 
@@ -334,7 +326,7 @@ class SignSGD(torch.optim.Optimizer):
                     continue
 
                 d_p = p.grad.detach()
-                update = d_p / (torch.abs(d_p)+1e-18)
+                update = d_p / (torch.abs(d_p)+1e-9)
                 p.add_(update, alpha=-lr)
 
             return loss
@@ -402,6 +394,8 @@ class ZOTrainer(ABC):
                 if projected_grad:
                     scale = -projected_grad * mu
                 p.add_(r, alpha=scale)
+            
+            torch.cuda.synchronize()
 
     @abstractmethod
     def train(self):
@@ -425,7 +419,6 @@ class SPSATrainer(ZOTrainer):
                 mu  = self.mu_sched(global_step)
 
                 losses = torch.empty(2, device=device)
-                x = {k: v.to(device, non_blocking=True) for k, v in x.items()} 
                 for i in range(2):
                     if i == 0:
                         self.perturb_params(mu, seed)
@@ -437,7 +430,7 @@ class SPSATrainer(ZOTrainer):
                         loss = out.loss
                         losses[i] = loss
                 
-                train_loss += losses[0].item() / args.logging_steps 
+                train_loss += losses[0].item()
 
                 self.perturb_params(mu, seed)
                 if ddp:
@@ -450,7 +443,9 @@ class SPSATrainer(ZOTrainer):
                 end_time = time.time() 
                 time_taken = end_time - start_time 
 
-                if (global_step+1) % args.logging_steps == 0: 
+                if global_step % args.logging_steps == 0: 
+                    if global_step != 0:
+                        train_loss = train_loss / args.logging_steps
                     val_loss = get_val_loss() 
                     if master_process:
                         log(train_loss, lr, val_loss, time_taken, epoch, global_step)
@@ -458,7 +453,7 @@ class SPSATrainer(ZOTrainer):
                 
                 global_step += 1
 
-class Adam(torch.optim.Optimizer):
+class ZeroAdam(torch.optim.Optimizer):
     def __init__(self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8):
 
         defaults = dict(lr=lr, betas=betas, eps=eps)
@@ -539,7 +534,6 @@ class RAdaZO(ZOTrainer):
                 mu  = self.mu_sched(global_step)
 
                 losses = torch.empty(2, device=device)
-                x = {k: v.to(device, non_blocking=True) for k, v in x.items()} 
                 for i in range(2):
                     if i == 0:
                         self.perturb_params(mu, seed)
@@ -692,7 +686,7 @@ match args.opt:
         trainer = SPSATrainer(model, lr_sched, mu_sched, init_seed)
     case "R-AdaZO":
         mu_sched = WSD(max_lr=args.mu, n_steps=n_steps, warmdown_ratio=0, warmup_ratio=0)
-        optimizer = Adam(model.parameters())
+        optimizer = ZeroAdam(model.parameters())
         trainer = RAdaZO(model, optimizer, lr_sched, mu_sched, init_seed)
 
 trainer.train()
