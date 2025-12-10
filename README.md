@@ -1,1 +1,1 @@
-# Zeroth-order reinforcement learning for LLM allignment
+# Zeroth-order reinforcement learning for LLM alignment
