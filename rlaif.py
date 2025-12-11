@@ -4,6 +4,7 @@ from torch.utils.data import DataLoader
 from vllm import LLM, SamplingParams
 import asyncio
 from openai import AsyncOpenAI
+import numpy as np
 
 # Parameters
 model = "Qwen/Qwen3-1.7B"
@@ -78,6 +79,27 @@ async def get_responses(prompts):
     results = await asyncio.gather(*tasks)
     return results
 
+def get_answer(response):
+    try:
+        start = response.find("\\boxed{") + 7
+        assert response[start] in ["A", "B"]
+        if response[start] == "A":
+            return 0
+        else:
+            return 1
+    except Exception:
+        return None
+
+def get_preference(responses):
+    answers = []
+    for r in responses:
+        answer = get_answer(r)
+        if answer is not None:
+            answers.append(answer)
+            
+    proba = np.array(answers).mean()
+    return proba
+
 # Create client / AI Labeler
 client = AsyncOpenAI(api_key=openai_api_key, base_url=openai_api_base)
     
@@ -94,9 +116,8 @@ vllm_model = LLM(model=model, worker_extension_cls="utils.myworker.MyWorker")
 dataset = load_dataset("HuggingFaceH4/ultrafeedback_binarized", split="train_prefs[:4000]")
 train_loader = DataLoader(dataset=dataset["prompt"], batch_size=n_prompts, collate_fn=collate_fn, shuffle=False, pin_memory=True)
 
-global_step = 0
-for raw_prompts, formatted_prompts in train_loader:
-    seed = init_seed + global_step
+for step, (raw_prompts, formatted_prompts) in enumerate(train_loader):
+    seed = init_seed + step
     outputs = []
 
     # Generate responses
@@ -116,3 +137,6 @@ for raw_prompts, formatted_prompts in train_loader:
 
     # Get AI feedback
     responses = asyncio.run(get_responses(prompts_labeler))
+
+    # Get preference probability Pr[1>0]
+    proba = get_preference(responses)
