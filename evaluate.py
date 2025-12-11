@@ -5,8 +5,10 @@ import os
 from torch.utils.data import DataLoader
 import time
 
-device = "cuda:3" if torch.cuda.is_available() else "cpu"
-batch_size = 512
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+batch_size = 128
 model_names = ["SFT", "DPO/checkpoint-5178"]
 
 def collate(batch):
@@ -36,14 +38,22 @@ for i, model_name in enumerate(model_names):
     column_names = dataset.column_names
     column_names.remove("prompt")
     dataset = dataset.remove_columns(column_names=column_names)
-
-    val_loader = DataLoader(dataset=dataset["prompt"], batch_size=batch_size, collate_fn=collate, shuffle=False, pin_memory=True)
-    for x in val_loader:
+    
+    val_loader = DataLoader(dataset=dataset["prompt"], batch_size=batch_size, collate_fn=collate,
+                             shuffle=False, pin_memory=True, num_workers=4, persistent_workers=True)
+    print("Starting generation for:", model_name)
+    for j, x in enumerate(val_loader):
         inputs = x["inputs"]
         prompts = x["prompts"]
         with torch.inference_mode():
             inputs = {k: v.to(device, non_blocking=True) for k, v in inputs.items()} 
+            time_start = time.time()
+            print("Batch Start:", j)
             output_ids = model.generate(**inputs, max_new_tokens=512)
+            torch.cuda.synchronize()
+            time_end = time.time()
+            time_taken = time_end - time_start
+            print(f"Batch {j} generation end, time taken: {time_taken:.4f} seconds")
             for ins, outs, prompt  in zip(inputs["input_ids"], output_ids, prompts):
                 answer = tokenizer.decode(outs[ins.shape[0]:], skip_special_tokens=True)
                 messages = [{"role": "user", "content": prompt}, {"role": "assistant", "content": answer}]
@@ -51,11 +61,13 @@ for i, model_name in enumerate(model_names):
                 if i == 0:
                     rows["prompt"].append(prompt)
 
+            print(f"Batch {j} saving done")
+            
 dataset = Dataset.from_dict(rows)
-dataset.save_to_disk("../SFTvsDPO")
+dataset.save_to_disk(f"../{model_names[0]}vs{model_names[1]}")
 
-model_name = "Skywork/Skywork-Reward-V2-Qwen3-0.6B"
-batch_size = 512
+model_name = "Skywork/Skywork-Reward-V2-Llama-3.1-8B"
+batch_size = 128
 
 rm = AutoModelForSequenceClassification.from_pretrained(
     model_name,

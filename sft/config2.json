@@ -1,0 +1,14 @@
+{
+  "model_name": "Qwen/Qwen3-1.7B",
+  "opt": "Adam",
+  "epochs": 1,
+  "train_batch_size": 8,
+  "grad_accum_steps": 2,
+  "val_batch_size": 8,
+  "logging_steps": 50,
+  "eval_steps": 1024,
+  "lr": 1e-5,
+  "mu": 1e-5,
+  "warmup_ratio": 0,
+  "warmdown_ratio": 1
+}
