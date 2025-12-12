@@ -9,7 +9,8 @@ import numpy as np
 # Parameters
 model = "Qwen/Qwen3-1.7B"
 labeler_model = "Qwen/Qwen3-14B"
-n_prompts = 2
+n_epochs = 1
+n_prompts = 16
 n_responses_per_prompt = 16
 init_seed = 16
 mu = 1e-4
@@ -113,40 +114,45 @@ vllm_model = LLM(model=model, worker_extension_cls="utils.myworker.MyWorker")
 dataset = load_dataset("HuggingFaceH4/ultrafeedback_binarized", split="train_prefs[:4000]")
 train_loader = DataLoader(dataset=dataset["prompt"], batch_size=n_prompts, collate_fn=collate_fn, shuffle=False, pin_memory=True)
 
+print("Total number of steps:", len(train_loader)*n_epochs)
+
 async def main():
     # Create client / AI Labeler
     client = AsyncOpenAI(api_key=openai_api_key, base_url=openai_api_base)
-        
-    for step, (raw_prompts, formatted_prompts) in enumerate(train_loader):
-        seed = init_seed + step
-        outputs = []
 
-        # Generate responses
-        for i in range(2):
-            if i == 0:
-                vllm_model.collective_rpc("perturb_params", args=(mu, seed))
-            else:
-                vllm_model.collective_rpc("perturb_params", args=(-2*mu, seed))
+    for epoch in range(n_epochs):
+        for step, (raw_prompts, formatted_prompts) in enumerate(train_loader):
+            seed = init_seed + step * (epoch+1)
+            outputs = []
 
-            outputs.append(vllm_model.generate(formatted_prompts, sampling_params))
+            # Generate responses
+            for i in range(2):
+                if i == 0:
+                    vllm_model.collective_rpc("perturb_params", args=(mu, seed))
+                else:
+                    vllm_model.collective_rpc("perturb_params", args=(-2*mu, seed))
 
-        # Restore current parameters
-        vllm_model.collective_rpc("perturb_params", args=(mu, seed))
+                outputs.append(vllm_model.generate(formatted_prompts, sampling_params))
 
-        # Prepare prompts for AI Labeler
-        prompts_labeler = get_prompts(outputs, raw_prompts)
-
-        # Get AI feedback
-        responses = await get_responses(prompts_labeler, client)
-
-        # Get preference probability Pr[1>0]
-        proba = get_preference(responses)
-
-        # Update parameters based on AI labeler preference
-        if proba > 1/2:
-            vllm_model.collective_rpc("perturb_params", args=(-mu, seed))
-        elif proba < 1/2:
+            # Restore current parameters
             vllm_model.collective_rpc("perturb_params", args=(mu, seed))
+
+            # Prepare prompts for AI Labeler
+            prompts_labeler = get_prompts(outputs, raw_prompts)
+
+            # Get AI feedback
+            responses = await get_responses(prompts_labeler, client)
+
+            # Get preference probability Pr[1>0]
+            proba = get_preference(responses)
+
+            print(f"Step: {step}, preference probability: {proba}")
+
+            # Update parameters based on AI labeler preference
+            if proba > 1/2:
+                vllm_model.collective_rpc("perturb_params", args=(-mu, seed))
+            elif proba < 1/2:
+                vllm_model.collective_rpc("perturb_params", args=(mu, seed))
 
 if __name__ == "__main__":
     asyncio.run(main())
