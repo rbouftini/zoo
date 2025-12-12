@@ -142,5 +142,11 @@ async def main():
         # Get preference probability Pr[1>0]
         proba = get_preference(responses)
 
+        # Update parameters based on AI labeler preference
+        if proba > 1/2:
+            vllm_model.collective_rpc("perturb_params", args=(-mu, seed))
+        elif proba < 1/2:
+            vllm_model.collective_rpc("perturb_params", args=(mu, seed))
+
 if __name__ == "__main__":
     asyncio.run(main())
