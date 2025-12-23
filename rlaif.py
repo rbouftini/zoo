@@ -146,7 +146,7 @@ async def main():
             # Get preference probability Pr[1>0]
             proba = get_preference(responses)
 
-            print(f"Step: {step}, preference probability: {proba}")
+            print(f"Step: {step}, preference probability: {proba:.4f}")
 
             # Update parameters based on AI labeler preference
             if proba > 1/2:
