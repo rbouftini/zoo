@@ -2,3 +2,4 @@
 checkpoints
 .vscode
 wandb
+.env
