@@ -88,21 +88,33 @@ def gen_batch(loader):
 def get_val_loss():
     model.eval() 
     steps = args.eval_steps // args.val_batch_size
-    losses = []
+    total_loss = 0.0
+    total_tokens = 0
+
     with torch.inference_mode(): 
         for _ in range(steps): 
             x = next(it_val)
             out = model(**x) 
-            loss = out.loss
-            losses.append(loss)
+            batch_loss_mean = out.loss
 
-    val_loss = torch.stack(losses).mean()
+            if "labels" in x:
+                token_count = (x["labels"] != -100).sum()
+                batch_loss_sum = batch_loss_mean.float() * token_count
+            
+            total_loss += batch_loss_sum
+            total_tokens += token_count
+
     if ddp:
-        dist.all_reduce(val_loss, op=dist.ReduceOp.AVG) 
+        dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+        dist.all_reduce(total_tokens, op=dist.ReduceOp.SUM)
 
-    val_loss = val_loss.item()   
+    if total_tokens == 0:
+        return 0.0
+
+    val_loss = total_loss / total_tokens
+    
     model.train()     
-    return val_loss
+    return val_loss.item()
             
 def collate(batch): 
     batch_ids, masks = [], []
@@ -672,7 +684,7 @@ class MSSTrainer(ZOTrainer):
 
 match args.opt:
     case "Adam":
-        optimizer = torch.optim.Adam(model.parameters(), fused=True)
+        optimizer = torch.optim.Adam(model.parameters(), fused=True, betas=(0.9, 0.9999))
         trainer = BpTrainer(model, optimizer, lr_sched)
     case "SignSGD":
         optimizer = SignSGD(model.parameters(), fused=True)
