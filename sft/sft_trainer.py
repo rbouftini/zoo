@@ -35,7 +35,7 @@ parser = argparse.ArgumentParser(parents=[parent_parser])
 parser.add_argument("--model_name", help="Model", 
                     default="Qwen/Qwen3-8B", type=str)
 parser.add_argument("--opt", help="Optimizer", 
-                    choices=["Adam", "SignSGD", "RSS", "MSS", "SPSA", "R-AdaZO"], default="Adam")
+                    choices=["Adafactor", "RSS", "MSS", "SPSA", "R-AdaZO"], default="Adafactor")
 parser.add_argument("--epochs", help="Number of epochs",
                     default=2, type=int)
 parser.add_argument("--train_batch_size", help="Batch size of training data",
@@ -252,7 +252,7 @@ config={
     "val_examples": len(dataset["test"]),
 }
 
-if args.opt in ["Adam", "SignSGD"]:
+if args.opt == "Adafactor":
     if master_process:
         wandb.init(
         project="sft",
@@ -268,7 +268,7 @@ else:
         config=config,
         )
 
-if args.opt in ["Adam", "SignSGD"]:
+if args.opt == "Adafactor":
     raw_model = AutoModelForCausalLM.from_pretrained(args.model_name, dtype="auto", attn_implementation="flash_attention_2") 
 else:
     raw_model = AutoModelForCausalLM.from_pretrained(args.model_name, dtype=torch.float16, attn_implementation="flash_attention_2")
@@ -683,11 +683,8 @@ class MSSTrainer(ZOTrainer):
                     global_step += 1
 
 match args.opt:
-    case "Adam":
-        optimizer = torch.optim.Adam(model.parameters(), fused=True, betas=(0.9, 0.9999))
-        trainer = BpTrainer(model, optimizer, lr_sched)
-    case "SignSGD":
-        optimizer = SignSGD(model.parameters(), fused=True)
+    case "Adafactor":
+        optimizer = torch.optim.Adafactor(model.parameters())
         trainer = BpTrainer(model, optimizer, lr_sched)
     case "RSS":
         trainer = RSSTrainer(model, lr_sched, init_seed)
